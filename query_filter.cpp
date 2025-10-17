@@ -21,6 +21,22 @@ struct AttributeIndex {
     uint32_t count;
 };
 
+// Nueva estructura para el índice de destino
+struct AccessibilityDestIndex {
+    uint32_t destination_id;
+    uint32_t block_id;
+    uint64_t offset;
+    uint32_t count;
+};
+
+// New struct for accessibility index
+struct AccIndexEntry {
+    uint32_t id;        // destination_id
+    uint32_t block_id;
+    uint64_t offset;
+    uint32_t count;
+};
+
 // Loads attribute values from block-based structure using mmap
 unordered_map<uint32_t, float> load_attribute_values(const string& basePath, uint32_t attr_num) {
     uint32_t attr_index = attr_num - 1;
@@ -69,6 +85,41 @@ unordered_map<uint32_t, float> load_attribute_values(const string& basePath, uin
     return values;
 }
 
+// Loads accessibility index into memory for fast lookup
+unordered_map<uint32_t, AccIndexEntry> load_accessibility_index(const string& basePath) {
+    unordered_map<uint32_t, AccIndexEntry> index_map;
+    string indexPath = basePath + "/index.bin";
+    ifstream indexFile(indexPath, ios::binary);
+    AccIndexEntry idx;
+    while (indexFile.read(reinterpret_cast<char*>(&idx), sizeof(idx))) {
+        index_map[idx.id] = idx;
+    }
+    indexFile.close();
+    return index_map;
+}
+
+// Loads accessibility records for a given destination_id using index in memory + mmap
+vector<Accessibility> load_accessibility_block(const string& basePath, const AccIndexEntry& idx) {
+    string blockPath = basePath + "/blocks/block_" + to_string(idx.block_id) + ".bin";
+    int fd = open(blockPath.c_str(), O_RDONLY);
+    if (fd < 0) return {};
+    struct stat sb;
+    if (fstat(fd, &sb) == -1) { close(fd); return {}; }
+    size_t map_len = sb.st_size;
+    void* map = mmap(nullptr, map_len, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map == MAP_FAILED) { close(fd); return {}; }
+    vector<Accessibility> records;
+    records.reserve(idx.count);
+    char* ptr = (char*)map + idx.offset;
+    for (uint32_t i = 0; i < idx.count; ++i) {
+        Accessibility a = *reinterpret_cast<Accessibility*>(ptr + i * sizeof(Accessibility));
+        records.push_back(a);
+    }
+    munmap(map, map_len);
+    close(fd);
+    return records;
+}
+
 int main(int argc, char** argv) {
     if (argc < 5) {
         cerr << "Usage: ./query_filter <percent> <origin_attr_name> <dest_attr_name> <output.txt>\n";
@@ -97,101 +148,69 @@ int main(int argc, char** argv) {
 
     auto originValues = load_attribute_values(originBasePath, originAttrNum);
     auto destValues = load_attribute_values(destBasePath, destAttrNum);
-
     auto t_attr_end = chrono::steady_clock::now();
+
     cout << "Origins loaded: " << originValues.size()
          << "  Destinations: " << destValues.size() << endl;
     cout << "Phase 1 (load attributes): "
          << chrono::duration<double>(t_attr_end - t_attr_start).count() << " s" << endl;
 
-    // === 2️⃣ Filter accessibility (multithreaded, detailed timing)
+    // === 2️⃣ Filter accessibility using new index-based blocks
     auto t_acc_start = chrono::steady_clock::now();
+
+    string accBasePath = outBase + "/accessibility";
+    auto accIndexMap = load_accessibility_index(accBasePath);
+
+    // Only process selected destination IDs
+    vector<uint32_t> selected_dest_ids;
+    for (const auto& [dest_id, _] : destValues) {
+        selected_dest_ids.push_back(dest_id);
+    }
 
     ofstream fout(outputPath);
     fout << "origin_id,destination_id,time,distance," << originAttr << "," << destAttr << "\n";
 
-    string accessibilityBlocksPath = outBase + "/accessibility/blocks";
-    vector<string> block_files;
-    for (const auto& entry : filesystem::directory_iterator(accessibilityBlocksPath)) {
-        block_files.push_back(entry.path());
-    }
-    sort(block_files.begin(), block_files.end());
+    size_t num_threads = thread::hardware_concurrency();
+    vector<thread> threads;
+    mutex fout_mutex;
 
-    unsigned int n_threads = thread::hardware_concurrency();
-    if (n_threads == 0) n_threads = 4;
-    vector<vector<string>> thread_results(n_threads);
+    auto t_filter_start = chrono::steady_clock::now();
 
-    // Timing variables
-    vector<double> thread_read_times(n_threads, 0.0);
-    vector<double> thread_filter_times(n_threads, 0.0);
-
-    auto worker = [&](int tid) {
-        auto t_read_start = chrono::steady_clock::now();
-        vector<string> local_lines;
-        for (size_t i = tid; i < block_files.size(); i += n_threads) {
-            auto t_file_read_start = chrono::steady_clock::now();
-            ifstream f(block_files[i], ios::binary);
-            vector<Accessibility> records;
-            Accessibility a;
-            while (f.read((char*)&a, sizeof(a))) {
-                records.push_back(a);
-            }
-            auto t_file_read_end = chrono::steady_clock::now();
-            thread_read_times[tid] += chrono::duration<double>(t_file_read_end - t_file_read_start).count();
-
-            auto t_filter_start = chrono::steady_clock::now();
-            for (const auto& rec : records) {
-                auto originIt = originValues.find(rec.origin_id);
-                auto destIt = destValues.find(rec.destination_id);
-                if (originIt != originValues.end() && destIt != destValues.end()) {
-                    ostringstream oss;
-                    oss << rec.origin_id << "," << rec.destination_id << ","
-                        << rec.time << "," << rec.distance << ","
-                        << originIt->second << "," << destIt->second << "\n";
-                    local_lines.push_back(oss.str());
+    auto process_dest_range = [&](size_t start, size_t end) {
+        ostringstream local_oss;
+        for (size_t i = start; i < end; ++i) {
+            uint32_t dest_id = selected_dest_ids[i];
+            auto it = accIndexMap.find(dest_id);
+            if (it == accIndexMap.end()) continue;
+            auto records = load_accessibility_block(accBasePath, it->second);
+            for (const auto& a : records) {
+                auto originIt = originValues.find(a.origin_id);
+                if (originIt != originValues.end()) {
+                    local_oss << a.origin_id << "," << a.destination_id << ","
+                              << a.time << "," << a.distance << ","
+                              << originIt->second << "," << destValues[a.destination_id] << "\n";
                 }
             }
-            auto t_filter_end = chrono::steady_clock::now();
-            thread_filter_times[tid] += chrono::duration<double>(t_filter_end - t_filter_start).count();
         }
-        thread_results[tid] = move(local_lines);
+        lock_guard<mutex> lock(fout_mutex);
+        fout << local_oss.str();
     };
 
-    auto t_threads_start = chrono::steady_clock::now();
-    vector<thread> threads;
-    for (unsigned int t = 0; t < n_threads; ++t) {
-        threads.emplace_back(worker, t);
+    size_t total = selected_dest_ids.size();
+    size_t chunk = (total + num_threads - 1) / num_threads;
+    for (size_t t = 0; t < num_threads; ++t) {
+        size_t start = t * chunk;
+        size_t end = min(start + chunk, total);
+        if (start >= end) break;
+        threads.emplace_back(process_dest_range, start, end);
     }
     for (auto& th : threads) th.join();
-    auto t_threads_end = chrono::steady_clock::now();
 
-    auto t_write_start = chrono::steady_clock::now();
-    size_t total_lines = 0;
-    for (const auto& lines : thread_results) {
-        total_lines += lines.size();
-        for (const auto& line : lines) {
-            fout << line;
-        }
-    }
+    auto t_filter_end = chrono::steady_clock::now();
+    cout << "Phase 2 (filtering + writing): "
+         << chrono::duration<double>(t_filter_end - t_filter_start).count() << " s" << endl;
+
     fout.close();
-    auto t_write_end = chrono::steady_clock::now();
-
-    auto t_acc_end = chrono::steady_clock::now();
-
-    // Print detailed timings
-    double total_read = accumulate(thread_read_times.begin(), thread_read_times.end(), 0.0);
-    double total_filter = accumulate(thread_filter_times.begin(), thread_filter_times.end(), 0.0);
-    double total_write = chrono::duration<double>(t_write_end - t_write_start).count();
-    double total_threads = chrono::duration<double>(t_threads_end - t_threads_start).count();
-    double total_acc = chrono::duration<double>(t_acc_end - t_acc_start).count();
-
-    cout << "Phase 2 breakdown:" << endl;
-    cout << "  Reading accessibility blocks: " << total_read << " s" << endl;
-    cout << "  Filtering records: " << total_filter << " s" << endl;
-    cout << "  Writing results: " << total_write << " s" << endl;
-    cout << "  Threads total (read+filter): " << total_threads << " s" << endl;
-    cout << "  Phase 2 (overall): " << total_acc << " s" << endl;
-    cout << "  Total filtered records: " << total_lines << endl;
 
     auto t_end = chrono::steady_clock::now();
     cout << "Total time: "

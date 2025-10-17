@@ -17,6 +17,12 @@ inline float frand(float a=0.0f, float b=1.0f) {
     return a + static_cast<float>(rand()) / RAND_MAX * (b - a);
 }
 
+// Returns the exact number of non-nulls for a column given the percentage and total rows
+inline uint64_t compute_non_nulls(uint32_t percent, uint32_t total_rows) {
+    if (percent >= 100) return total_rows;
+    return (total_rows * percent) / 100;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) {
         cerr << "Usage: ./generate_full_dataset <output_dir> <percent>\n";
@@ -33,20 +39,14 @@ int main(int argc, char** argv) {
     int percent_int = static_cast<int>(percent * 100 + 0.5f);
     string percent_str = to_string(percent_int) + "p";
 
-    srand(42);
+    // Always use seed 33
+    srand(33);
+
     filesystem::create_directories(outdir);
 
     // Calculate scaled sizes
     uint32_t num_origins = static_cast<uint32_t>(NUM_ORIGINS * percent);
     uint32_t num_dests   = static_cast<uint32_t>(NUM_DESTS * percent);
-
-    // Generate null percentages for each attribute column
-    vector<float> origin_null_perc(ORIGIN_ATTRS);
-    vector<float> dest_null_perc(DEST_ATTRS);
-    for (uint32_t a = 0; a < ORIGIN_ATTRS; ++a)
-        origin_null_perc[a] = frand(0.6f, 0.6f);
-    for (uint32_t a = 0; a < DEST_ATTRS; ++a)
-        dest_null_perc[a] = frand(0.6f, 0.6f);
 
     auto format_size = [](uint64_t bytes) -> string {
         char buf[64];
@@ -72,7 +72,7 @@ int main(int argc, char** argv) {
 
         // Write header
         f_txt << "id";
-        for (uint32_t a = 1; a <= ORIGIN_ATTRS; ++a)
+        for (uint32_t a = 0; a < ORIGIN_ATTRS; ++a)
             f_txt << ",att" << a;
         f_txt << "\n";
 
@@ -81,9 +81,13 @@ int main(int argc, char** argv) {
             f_bin.write((char*)&id, 4);
             if (id < 100) f_txt << id;
             for (uint32_t a = 0; a < ORIGIN_ATTRS; ++a) {
+                // Not nulls at the beginning, nulls at the end (as before)
+                float percent_non_null = (a == 100) ? 1.0f : (a < 100 ? a / 100.0f : 0.0f);
+                uint64_t n_not_nulls = uint64_t(ceil(percent_non_null * num_origins));
+                if (a >= 100) n_not_nulls = num_origins;
+                if (n_not_nulls > num_origins) n_not_nulls = num_origins;
                 float val;
-                bool is_null = (frand() < origin_null_perc[a]);
-                if (is_null) {
+                if (id < num_origins - n_not_nulls) {
                     val = NAN;
                     f_bin.write((char*)&val, 4);
                     if (id < 100) f_txt << ",NA";
@@ -113,7 +117,7 @@ int main(int argc, char** argv) {
 
         // Write header
         f_txt << "id";
-        for (uint32_t a = 1; a <= DEST_ATTRS; ++a)
+        for (uint32_t a = 0; a < DEST_ATTRS; ++a)
             f_txt << ",att" << a;
         f_txt << "\n";
 
@@ -122,9 +126,12 @@ int main(int argc, char** argv) {
             f_bin.write((char*)&id, 4);
             if (id < 100) f_txt << id;
             for (uint32_t a = 0; a < DEST_ATTRS; ++a) {
+                float percent_non_null = (a == 100) ? 1.0f : (a < 100 ? a / 100.0f : 0.0f);
+                uint64_t n_not_nulls = uint64_t(ceil(percent_non_null * num_dests));
+                if (a >= 100) n_not_nulls = num_dests;
+                if (n_not_nulls > num_dests) n_not_nulls = num_dests;
                 float val;
-                bool is_null = (frand() < dest_null_perc[a]);
-                if (is_null) {
+                if (id < num_dests - n_not_nulls) {
                     val = NAN;
                     f_bin.write((char*)&val, 4);
                     if (id < 100) f_txt << ",NA";
