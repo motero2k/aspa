@@ -1,0 +1,5 @@
+dataset_raw/*
+!dataset_raw/.keep
+out/*
+!out/.keep
+result*.txt
