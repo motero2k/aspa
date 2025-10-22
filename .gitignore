@@ -2,4 +2,9 @@ dataset_raw/*
 !dataset_raw/.keep
 out/*
 !out/.keep
+dataset_processed/*
+!dataset_processed/.keep
+results/*
+!results/.keep
 result*.txt
+*.log
